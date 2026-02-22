@@ -12,9 +12,11 @@ const PRICE_CHANGE_THRESHOLD = 0.05; // 5% threshold
 const DATA_FILE = path.join(__dirname, 'bot-data.json');
 let botData = {
   subscribers: new Set(),
-  priceHistory: [], // Array of { timestamp, price, marketCap }
+  subscriberSettings: {}, // chatId -> { threshold: number }
+  priceHistory: [],
   lastAlert: null
 };
+const DEFAULT_THRESHOLD = 5; // 5%
 
 // Load existing data
 function loadData() {
@@ -22,6 +24,7 @@ function loadData() {
     if (fs.existsSync(DATA_FILE)) {
       const data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
       botData.subscribers = new Set(data.subscribers || []);
+      botData.subscriberSettings = data.subscriberSettings || {};
       botData.priceHistory = data.priceHistory || [];
       botData.lastAlert = data.lastAlert;
       console.log(`Loaded ${botData.subscribers.size} subscribers and ${botData.priceHistory.length} price points`);
@@ -36,7 +39,8 @@ function saveData() {
   try {
     const data = {
       subscribers: Array.from(botData.subscribers),
-      priceHistory: botData.priceHistory.slice(-288), // Keep last 24 hours (288 data points at 5min intervals)
+      subscriberSettings: botData.subscriberSettings,
+      priceHistory: botData.priceHistory.slice(-288),
       lastAlert: botData.lastAlert
     };
     fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
@@ -82,13 +86,11 @@ async function fetchPriceData() {
   }
 }
 
-// Check for price alerts (>5% change in 1 hour)
-function checkForPriceAlert(currentData) {
+// Check price change in last hour
+function getPriceChange(currentData) {
   if (!currentData || currentData.price <= 0) return null;
   
   const oneHourAgo = Date.now() - (60 * 60 * 1000);
-  
-  // Find price from approximately 1 hour ago
   const historicalPrice = botData.priceHistory.find(entry => entry.timestamp <= oneHourAgo);
   
   if (!historicalPrice || historicalPrice.price <= 0) {
@@ -99,63 +101,58 @@ function checkForPriceAlert(currentData) {
   const priceChange = (currentData.price - historicalPrice.price) / historicalPrice.price;
   const percentChange = priceChange * 100;
   
-  console.log(`Price change in 1h: ${percentChange.toFixed(2)}% (from $${historicalPrice.price.toFixed(8)} to $${currentData.price.toFixed(8)})`);
+  console.log(`Price change in 1h: ${percentChange.toFixed(2)}%`);
   
-  if (Math.abs(percentChange) >= (PRICE_CHANGE_THRESHOLD * 100)) {
-    // Check if we haven't alerted recently (prevent spam)
-    const lastAlertTime = botData.lastAlert ? new Date(botData.lastAlert).getTime() : 0;
-    const timeSinceLastAlert = Date.now() - lastAlertTime;
-    const minAlertInterval = 30 * 60 * 1000; // 30 minutes
-    
-    if (timeSinceLastAlert >= minAlertInterval) {
-      return {
-        percentChange,
-        currentPrice: currentData.price,
-        previousPrice: historicalPrice.price,
-        marketCap: currentData.marketCap,
-        direction: priceChange > 0 ? 'up' : 'down'
-      };
-    } else {
-      console.log('Skipping alert - too soon since last alert');
-    }
-  }
-  
-  return null;
+  return {
+    percentChange,
+    currentPrice: currentData.price,
+    previousPrice: historicalPrice.price,
+    marketCap: currentData.marketCap,
+    direction: priceChange > 0 ? 'up' : 'down'
+  };
 }
 
-// Send alert to all subscribers
-async function sendAlert(bot, alertData) {
-  const emoji = alertData.direction === 'up' ? '🚀' : '📉';
-  const direction = alertData.direction === 'up' ? 'UP' : 'DOWN';
-  const changeText = alertData.percentChange > 0 ? `+${alertData.percentChange.toFixed(2)}%` : `${alertData.percentChange.toFixed(2)}%`;
+function getThreshold(chatId) {
+  return (botData.subscriberSettings[chatId] && botData.subscriberSettings[chatId].threshold) || DEFAULT_THRESHOLD;
+}
+
+// Send alerts to subscribers whose threshold is met
+async function sendAlerts(bot, changeData) {
+  if (!changeData) return;
+  
+  const emoji = changeData.direction === 'up' ? '🚀' : '📉';
+  const direction = changeData.direction === 'up' ? 'UP' : 'DOWN';
+  const changeText = changeData.percentChange > 0 ? `+${changeData.percentChange.toFixed(2)}%` : `${changeData.percentChange.toFixed(2)}%`;
   
   const message = `${emoji} OWOCKIBOT PRICE ALERT!\n\n` +
     `Price moved ${direction} ${changeText} in the last hour!\n\n` +
-    `📊 Current Price: $${alertData.currentPrice.toFixed(8)}\n` +
-    `📈 Previous Price: $${alertData.previousPrice.toFixed(8)}\n` +
-    `💰 Market Cap: $${alertData.marketCap.toLocaleString()}\n\n` +
+    `📊 Current Price: $${changeData.currentPrice.toFixed(8)}\n` +
+    `📈 Previous Price: $${changeData.previousPrice.toFixed(8)}\n` +
+    `💰 Market Cap: $${changeData.marketCap.toLocaleString()}\n\n` +
     `🔗 Trade: https://clanker.world/clanker/0xfdc933ff4e2980d18becf48e4e030d8463a2bb07\n` +
     `📈 Chart: https://dexscreener.com/base/0xfdc933ff4e2980d18becf48e4e030d8463a2bb07`;
   
-  console.log(`Sending alert to ${botData.subscribers.size} subscribers`);
-  
-  // Send to all subscribers
+  let sent = 0;
   for (const chatId of botData.subscribers) {
+    const threshold = getThreshold(chatId);
+    if (Math.abs(changeData.percentChange) < threshold) continue;
+    
     try {
       await bot.telegram.sendMessage(chatId, message);
+      sent++;
     } catch (error) {
-      console.error(`Failed to send alert to ${chatId}:`, error);
-      // Remove invalid subscribers
+      console.error(`Failed to send to ${chatId}:`, error.message);
       if (error.response && error.response.error_code === 403) {
         botData.subscribers.delete(chatId);
-        console.log(`Removed blocked subscriber: ${chatId}`);
       }
     }
   }
   
-  // Update last alert time
-  botData.lastAlert = new Date().toISOString();
-  saveData();
+  if (sent > 0) {
+    console.log(`Sent alerts to ${sent} subscribers`);
+    botData.lastAlert = new Date().toISOString();
+    saveData();
+  }
 }
 
 // Main price monitoring function
@@ -171,10 +168,10 @@ async function monitorPrice(bot) {
   // Add to history
   botData.priceHistory.push(currentData);
   
-  // Check for alerts
-  const alertData = checkForPriceAlert(currentData);
-  if (alertData) {
-    await sendAlert(bot, alertData);
+  // Check for alerts per subscriber
+  const changeData = getPriceChange(currentData);
+  if (changeData) {
+    await sendAlerts(bot, changeData);
   }
   
   // Save data
@@ -225,6 +222,7 @@ function initBot() {
       `📊 Commands:\n` +
       `/subscribe - Subscribe to price alerts\n` +
       `/unsubscribe - Unsubscribe from alerts\n` +
+      `/threshold <percent> - Set your alert threshold (default: 5%)\n` +
       `/status - View current price and stats\n\n` +
       `🔗 OWOCKIBOT Links:\n` +
       `• Website: https://owockibot.xyz\n` +
@@ -262,6 +260,28 @@ function initBot() {
     }
   });
   
+  bot.command('threshold', (ctx) => {
+    const chatId = ctx.chat.id.toString();
+    const args = ctx.message.text.split(' ');
+    
+    if (args.length < 2) {
+      const current = getThreshold(chatId);
+      ctx.reply(`📊 Your current alert threshold: ${current}%\n\nUsage: /threshold <percent>\nExample: /threshold 3 (alert on 3% moves)\nExample: /threshold 10 (alert on 10% moves)\n\nRange: 1-50%`);
+      return;
+    }
+    
+    const val = parseFloat(args[1]);
+    if (isNaN(val) || val < 1 || val > 50) {
+      ctx.reply('❌ Threshold must be between 1 and 50 (percent).');
+      return;
+    }
+    
+    if (!botData.subscriberSettings[chatId]) botData.subscriberSettings[chatId] = {};
+    botData.subscriberSettings[chatId].threshold = val;
+    saveData();
+    ctx.reply(`✅ Alert threshold set to ${val}%. You'll be notified when price moves >${val}% in 1 hour.`);
+  });
+
   bot.command('status', async (ctx) => {
     const status = formatStatus();
     await ctx.reply(status);
