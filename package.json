@@ -1,0 +1,17 @@
+{
+  "name": "owockibot-tg-alert",
+  "version": "1.0.0",
+  "description": "Telegram bot for OWOCKIBOT price alerts",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "node bot.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": ["telegram", "bot", "owockibot", "alerts", "crypto"],
+  "author": "tej",
+  "license": "MIT",
+  "dependencies": {
+    "telegraf": "^4.16.3"
+  }
+}
